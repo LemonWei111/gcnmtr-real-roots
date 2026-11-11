@@ -169,4 +169,4 @@ Completeness is layered:
 
 ## License
 
-MIT (or your preferred license). See `LICENSE`.
+MIT . See `LICENSE`.
