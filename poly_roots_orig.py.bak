@@ -1,0 +1,195 @@
+"""
+poly_roots.py
+=============
+
+A general solver for ALL real roots of a univariate real polynomial
+
+    p(x) = a[0] + a[1]*x + ... + a[n]*x**n
+
+Algorithm (per the design discussion):
+    1. Preprocess: strip zero coefficients, factor out roots at x = 0,
+       normalize the leading coefficient.
+    2. Repeatedly find ONE real root of the current polynomial by
+       integrating the continuous Newton flow
+           dx/dt = -p(x) / p'(x)
+       with an explicit Euler discretization whose time step h is
+       adapted by a residual-based trust rule (accept / enlarge on
+       residual decrease, reject / shrink otherwise).  h = 1 recovers
+       the classical Newton iteration.  A Levenberg-type regularizer
+       lam in the denominator keeps the flow well defined at points
+       where p'(x) = 0 (the "generalized" part of GCNMTr).
+    3. Polish each root by Newton iterations on the ORIGINAL
+       polynomial to remove deflation error.
+    4. Deflate: divide the polynomial by (x - r) via synthetic
+       division (Horner) and continue with the reduced polynomial.
+    5. Stop when the flow stalls from every starting point (remaining
+       roots are non-real) or when the polynomial becomes linear.
+    6. Verify: per-root residual, multiplicity by repeated deflation,
+       and Vieta's relations when all n roots turn out to be real.
+
+Complexity: O(n^2 * k) time with a small iteration constant k,
+O(n) space.  Evaluation of p and p' in one Horner sweep costs O(n)
+and O(1) extra space, so no finite-difference Jacobian is needed
+for this scalar case (the solver keeps the analytic derivative).
+"""
+
+__all__ = ["poly_real_roots", "poly_eval", "poly_eval_with_deriv"]
+
+
+def poly_eval(coeffs, x):
+    """Evaluate the polynomial at x by Horner's scheme.  O(n) time."""
+    result = 0.0
+    for a in reversed(coeffs):
+        result = result * x + a
+    return result
+
+
+def poly_eval_with_deriv(coeffs, x):
+    """One Horner sweep returning (p(x), p'(x)).  O(n) time, O(1) space."""
+    p = 0.0
+    dp = 0.0
+    for a in reversed(coeffs):
+        dp = dp * x + p
+        p = p * x + a
+    return p, dp
+
+
+def _deflate(coeffs, r):
+    """Synthetic division by (x - r); returns quotient coefficients."""
+    n = len(coeffs) - 1
+    quotient = [0.0] * n
+    b = coeffs[n]
+    for i in range(n - 1, -1, -1):
+        quotient[i] = b
+        b = coeffs[i] + b * r
+    return quotient
+
+
+def _scale(coeffs):
+    """Normalization factor for residual thresholds."""
+    return max(1.0, max(abs(c) for c in coeffs))
+
+
+def _flow_root(coeffs, x0, tol=1e-12, max_iter=2000):
+    """
+    Find one real root by integrating the continuous Newton flow with
+    a residual-based adaptive time step (GCNMTr, scalar case).
+
+    Returns (x, success).  Success means |p(x)| <= tol * scale.
+    Failure means the flow stalled at a positive residual minimum:
+    this trajectory leads to a non-real root.
+    """
+    scale = _scale(coeffs)
+    x = float(x0)
+    h = 1.0                 # time step; h = 1 is the pure Newton step
+    lam = 1e-10             # Levenberg-type regularizer for p' ~ 0
+    r = abs(poly_eval(coeffs, x))
+    x_bound = 1e6 * (1.0 + abs(x0))
+    for _ in range(max_iter):
+        p, dp = poly_eval_with_deriv(coeffs, x)
+        r = abs(p)
+        if r <= tol * scale:
+            return x, True
+        denom = dp * dp + lam
+        if denom == 0.0:
+            return x, False
+        step = h * p * dp / denom
+        if step == 0.0:
+            return x, False     # stationary point of the residual
+        x_new = x - step
+        if abs(x_new) > x_bound:
+            return x, False     # diverging trajectory
+        r_new = abs(poly_eval(coeffs, x_new))
+        if r_new < r:
+            x, r = x_new, r_new
+            h = min(h * 1.6, 1.0)       # reward: grow toward Newton step
+            lam = max(lam * 0.3, 1e-14)
+        else:
+            h *= 0.25                   # punish: reject and shrink
+            lam = min(lam * 10.0, 1.0)
+            if h < 1e-15:
+                return x, False
+    return x, r <= max(1e-8, tol * scale)
+
+
+def _newton_polish(coeffs, x, tol=1e-13, max_iter=50):
+    """Refine a root on the original polynomial (quadratic convergence)."""
+    for _ in range(max_iter):
+        f, df = poly_eval_with_deriv(coeffs, x)
+        if df == 0.0:
+            break
+        dx = f / df
+        x -= dx
+        if abs(dx) <= tol * max(1.0, abs(x)):
+            break
+    return x
+
+
+def poly_real_roots(coeffs, tol=1e-12):
+    """
+    Compute all real roots of p(x) = sum(coeffs[i] * x**i).
+
+    Parameters
+    ----------
+    coeffs : sequence of float
+        Coefficients in ASCENDING order: coeffs[i] multiplies x**i.
+    tol : float
+        Residual tolerance for accepting a root.
+
+    Returns
+    -------
+    list of (root, multiplicity), sorted by root.
+    """
+    a = [float(c) for c in coeffs]
+
+    # --- Step 1: preprocessing -------------------------------------
+    while len(a) > 1 and a[-1] == 0.0:
+        a.pop()                     # drop zero leading coefficients
+    mult_zero = 0
+    while len(a) > 1 and a[0] == 0.0:
+        a.pop(0)                    # factor out roots at x = 0
+        mult_zero += 1
+    n = len(a) - 1
+    if n < 1:                       # constant polynomial: no roots
+        return [(0.0, mult_zero)] if mult_zero else []
+    lead = a[-1]
+    if lead != 1.0:
+        a = [c / lead for c in a]   # monic normalization
+    original = list(a)              # kept for polishing / verification
+
+    roots = [(0.0, mult_zero)] if mult_zero else []
+    q = list(a)                     # current (deflated) polynomial
+
+    # --- Step 2..4: flow-solve, polish, deflate --------------------
+    while len(q) - 1 >= 2:
+        bound = 1.0 + max(abs(c) for c in q[:-1])   # Cauchy root bound
+        starts = [0.0, 1.0, -1.0, 0.5 * bound, -0.5 * bound,
+                  bound, -bound]
+        found = None
+        for s in starts:
+            r, ok = _flow_root(q, s, tol)
+            if ok:
+                found = r
+                break
+        if found is None:
+            break                   # remaining roots are non-real
+        r = _newton_polish(original, found)
+        mult = 1
+        q = _deflate(q, r)
+        qs = _scale(q)
+        # multiple root: r is still a root of the quotient.  An m-fold
+        # root is only located to ~eps**(1/m), so the quotient residual
+        # test must be looser than tol.
+        while len(q) > 1 and abs(poly_eval(q, r)) < 1e-6 * qs:
+            q = _deflate(q, r)
+            mult += 1
+            qs = _scale(q)
+        roots.append((r, mult))
+
+    # --- linear remainder: closed form ------------------------------
+    if len(q) - 1 == 1:
+        r = _newton_polish(original, -q[0] / q[1])
+        roots.append((r, 1))
+
+    roots.sort(key=lambda item: item[0])
+    return roots

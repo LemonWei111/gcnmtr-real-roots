@@ -1,0 +1,13 @@
+# ---- Python ----
+__pycache__/
+
+
+# ---- test / coverage ----
+.bck
+
+# ---- logs ----
+*.log
+
+# ---- output ----
+.docx
+.pdf
